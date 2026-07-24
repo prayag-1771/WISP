@@ -1,0 +1,37 @@
+# wisp pipeline parameters (S2.7) — all tunables live here, versioned in git.
+# Nothing reads these yet; each module will pull its params from here as you build it.
+# Values below are placeholders / sensible starting points, not tuned.
+
+version: 0
+
+source:
+  sample_rate_hz: 100          # target CSI packet rate
+  n_subcarriers: 64            # raw subcarriers before masking
+
+preprocess:                    # S2
+  drop_null_guard: true        # drop null/guard subcarriers
+  dead_variance_threshold: 1.0e-6   # subcarriers below this variance (empty room) are dead
+  hampel_window: 5             # Hampel outlier rejection window (samples)
+  hampel_n_sigma: 3.0
+  bandpass_hz: [0.5, 10.0]     # amplitude band-pass
+  window_short_s: 1.0          # transient window
+  window_long_s: 4.0           # stillness window
+
+features:                      # S3
+  # motion intensity, transient sharpness, stillness duration — no params yet
+
+calibrate:                     # S4
+  normal_percentile: 99.0      # threshold percentile from the room's own normal stats
+
+detect:                        # S5
+  isolation_forest:
+    n_estimators: 100
+    contamination: 0.01
+    random_state: 0
+
+state_machine:                 # S6 — the false-alarm killer
+  stillness_confirm_s: 20.0    # stillness must persist this long to CONFIRM
+  debounce_s: 5.0              # hysteresis before re-arming
+
+evaluate:                      # S9
+  false_alarm_window: week     # report unit for the gate number
