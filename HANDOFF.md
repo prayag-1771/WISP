@@ -47,8 +47,8 @@ Example output of `run_live.py`:
 | `wisp/evaluate/harness.py` | S9 | ✅ recall / FA-per-week / latency |
 | `scripts/{calibrate,run_live,evaluate}.py` | — | ✅ wired, runnable |
 | `tests/` | S3.7 | ✅ 6 passing (features + state machine) |
+| `wisp/source/csi_bench_source.py` | — | ✅ adapter to replay CSI-Bench `.h5` clips (needs `h5py`) |
 | `wisp/source/serial_source.py` | S1.6 | ⛔ TODO — **write LAST**, after hardware Milestone 1 |
-| `wisp/source/csi_bench_source.py` | — | ⛔ optional — adapter to validate on CSI-Bench fall clips (needs `h5py`) |
 
 ## What's genuinely left
 
@@ -59,8 +59,18 @@ Example output of `run_live.py`:
    (`scripts/calibrate.py --replay <log.csv>`), and re-run `evaluate.py` on real
    recordings with a labels CSV (`harness.load_events`).
 3. **The gate:** weeks of continuous real-room operation, logging every alert for review.
-4. *Optional:* `csi_bench_source.py` for a real-CSI sanity check; the supervised S5.4
-   benchmark for an investor credibility number (GPU, ~sub-hour, NOT the shipping model).
+4. *Optional, already wired:* validate on real CSI via CSI-Bench. Download the Fall
+   single-task subset (Kaggle: `guozhenjennzhu/csi-bench`), then:
+   ```python
+   from wisp.source.csi_bench_source import CSIBenchSource
+   src = CSIBenchSource("path/to/FallDetection")   # a file or a directory of .h5
+   print(src.list_datasets())                       # confirm the in-file layout first
+   for t, amp in src.stream():                       # same (t, amp) contract as everything else
+       ...
+   ```
+   Note this is a real-CSI *code* sanity check, not the gate (see the module docstring).
+   The supervised S5.4 benchmark (investor credibility number) is still separate — GPU,
+   ~sub-hour, NOT the shipping model.
 
 ## Tuning knobs (all in one place)
 
