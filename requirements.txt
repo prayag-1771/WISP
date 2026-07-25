@@ -5,3 +5,4 @@ pyserial
 pyyaml
 matplotlib
 pytest
+h5py        # optional — only for wisp.source.csi_bench_source (CSI-Bench .h5 replay)
