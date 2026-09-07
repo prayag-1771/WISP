@@ -5,8 +5,19 @@
 version: 0
 
 source:
-  sample_rate_hz: 100          # target CSI packet rate
+  sample_rate_hz: 100          # target CSI packet rate (fallback only — live runs MEASURE it)
   n_subcarriers: 64            # raw subcarriers before masking
+
+single_board:                  # the one-ESP32 sensor (see docs/SINGLE_ESP32.md)
+  # One board measures CSI on frames it RECEIVES, so the transmitter is the router (STA
+  # mode), the laptop (SoftAP mode), or whatever is on air (sniffer mode).
+  baud: 921600                 # firmware console baud; 115200 caps the rate near 20 Hz
+  subcarriers: 62              # LLTF-only firmware: constant width, no width-lock needed
+  traffic_hz: 50               # UDP datagrams/s to the board = the CSI sample rate we get
+  traffic_port: 8888           # must match CONFIG_WISP_UDP_PORT in the firmware
+  self_ping_ms: 30             # firmware pings its gateway: ~33 Hz with no laptop help
+  gap_reset_s: 3.0             # a CSI dropout longer than this resets detection
+  min_separation: 2.0          # occupied/still ratio below which a placement is unusable
 
 preprocess:                    # S2
   drop_null_guard: true        # drop null/guard subcarriers

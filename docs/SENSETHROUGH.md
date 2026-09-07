@@ -2,6 +2,13 @@
 
 **Through-wall-agnostic fall detection over Wi-Fi CSI, using two ESP32 boards.**
 
+> **Running one board instead?** That is now the primary path — see
+> [`SINGLE_ESP32.md`](SINGLE_ESP32.md). It needs no second board, and most of the trouble
+> documented below (two USB attachments, boards resetting out of sync, links that fail to
+> re-form, varying packet widths) simply does not arise there. This document remains the
+> reference for the two-board rig, and its physics, calibration and placement sections
+> apply to both.
+
 This document covers the **live, running system** end to end: how it works, how the two
 ESP32s are brought up, how detection is calibrated and tuned, where to place the boards,
 and how to recover when the radio link misbehaves. It complements — not replaces — the

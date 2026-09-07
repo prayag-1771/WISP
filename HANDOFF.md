@@ -4,21 +4,39 @@ Snapshot for whoever picks this up next. Everything below is on `main`.
 
 ## TL;DR
 
-The **synthetic-data MVP runs end-to-end today, with zero hardware.** Calibrate a room
-profile, run the one-line alert console, and print the Phase 0 gate metrics — all from
-`python scripts/*.py`. On the synthetic demo it currently scores **recall 2/2, kinds
-correct 2/2, 0 false alarms/week.** What remains is real: the live serial source (after
-hardware Milestone 1), an optional CSI-Bench validation adapter, and — the actual point
-— weeks of real-room measurement.
+The MVP runs end-to-end **on a single ESP32**, and also with zero hardware. Flash
+`firmware/single_esp32_csi`, run `scripts/serial_check.py`, and the same pipeline that
+scores recall 2/2 on the synthetic demo runs on live CSI.
 
-## Run it
+Verified on hardware 2026-09-08: 62 subcarriers, stable width, 33 Hz self-ping / 66 Hz with
+the traffic generator, 0 dropped packets.
+
+**The open blocker is physical, not software:** the first live placement measured a
+still→occupied separation of **1.6×** (2× is the minimum) and produced a false "slow
+collapse" within a minute. The board and its transmitter have to be positioned so a person
+crosses the path between them. After that: staged falls, real recordings, and — the actual
+point — weeks of real-room measurement.
+
+## Run it (single board)
+
+```
+python scripts/serial_check.py --port /dev/ttyUSB0 --baud 921600   # 1. is CSI flowing?
+python scripts/traffic.py --host <board-ip> --hz 50                # 2. set the sample rate
+python scripts/run_live.py --serial /dev/ttyUSB0 --baud 921600     # 3. calibrate + detect
+python server/app.py --serial /dev/ttyUSB0 --baud 921600           # 4. dashboard
+```
+
+Step 3 prints `still->occupied separation: N x` — below 2× nothing downstream is meaningful.
+Full guide: `docs/SINGLE_ESP32.md`.
+
+## Run it (no hardware)
 
 ```
 pip install -r requirements.txt
 python scripts/evaluate.py      # auto-calibrates, prints the gate table (recall / FA-per-week)
 python scripts/run_live.py      # prints the one-line alert console on the synthetic demo
 python scripts/calibrate.py     # fits + saves a room_profile.pkl explicitly
-pytest -q                       # 6 tests: features on known signals + state-machine logic
+pytest -q                       # 49 tests, none of which need hardware
 ```
 
 Example output of `run_live.py`:
@@ -34,7 +52,7 @@ Example output of `run_live.py`:
 | --- | --- | --- |
 | `wisp/source/base.py` | S1.6 | ✅ `CSISource` interface |
 | `wisp/source/synthetic.py` | S1.6 | ✅ labeled fake room (`demo()`, `normal_only()`) |
-| `wisp/ingest/parser.py` | S1 | ✅ parses `[I Q ...]` → amplitude *(verify vs a real ESP32 line)* |
+| `wisp/ingest/parser.py` | S1 | ✅ parses `[I Q ...]` → amplitude — **verified against real ESP32 lines** |
 | `wisp/ingest/logger.py` | S1.5 | ✅ `RawLogger` CSV writer |
 | `wisp/source/replay.py` | S1.6 | ✅ replays a RawLogger CSV |
 | `wisp/preprocess/clean.py` | S2 | ✅ mask + Hampel |
@@ -45,18 +63,20 @@ Example output of `run_live.py`:
 | `wisp/calibrate/profile.py` | S4 | ✅ `RoomProfile.fit/save/load` |
 | `wisp/pipeline.py` | — | ✅ shared `run_detection` loop |
 | `wisp/evaluate/harness.py` | S9 | ✅ recall / FA-per-week / latency |
-| `scripts/{calibrate,run_live,evaluate}.py` | — | ✅ wired, runnable |
-| `tests/` | S3.7 | ✅ 6 passing (features + state machine) |
+| `scripts/{serial_check,traffic,record,calibrate,run_live,evaluate}.py` | — | ✅ wired, runnable |
 | `wisp/source/csi_bench_source.py` | — | ✅ adapter to replay CSI-Bench `.h5` clips (needs `h5py`) |
-| `wisp/source/serial_source.py` | S1.6 | ✅ live ESP32 reader (pyserial, lazy import) — needs a board to *run*, but written |
+| `wisp/source/serial_source.py` | S1.6 | ✅ original minimal pyserial reader (superseded live by `live_reader.py`) |
 | `scripts/plot_run.py` | — | ✅ saves `run.png` — motion + sharpness + alerts |
-| `tests/` | — | ✅ 20 passing (features, state machine, parser, logger↔replay, model, profile, harness, csi-bench) |
+| `wisp/source/live_reader.py` | S1.6 | ✅ live single-board reader — running on hardware |
+| `wisp/source/traffic.py` | — | ✅ UDP generator (sets the live sample rate) |
+| `firmware/single_esp32_csi/` | H3 | ✅ ESP-IDF CSI firmware — flashed and verified |
+| `tests/` | — | ✅ 49 passing (adds live reader + single-board engine) |
 
 ## What's genuinely left
 
-1. **`serial_source.py`** (post-Milestone-1). Read serial → `parser.parse_csi_line` →
-   yield `(t, amp)`. Then everything above runs on live data unchanged. Confirm the real
-   `CSI_DATA` column layout matches `parser.py` (only the trailing `[...]` block is used).
+1. **A placement that works.** Move the ESP32 (and, if you can, its transmitter) so a person
+   crosses the path between them. Re-run `scripts/run_live.py --serial ...` until separation
+   is ≥ 2×, ideally ≥ 5×. Nothing else on this list matters until this passes.
 2. **Record real normal + staged falls**, calibrate on the real normal
    (`scripts/calibrate.py --replay <log.csv>`), and re-run `evaluate.py` on real
    recordings with a labels CSV (`harness.load_events`).

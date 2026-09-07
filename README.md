@@ -1,7 +1,7 @@
 # wisp
 
 **Phase 0 MVP.** A program that watches a room via Wi-Fi Channel State Information
-(CSI) — sensed by two ESP32 boards — and prints an alert when someone collapses,
+(CSI) — sensed by **a single ESP32** — and prints an alert when someone collapses,
 plus an evaluation harness that measures whether those alerts can be *trusted*.
 
 This is not a product. It has no polish, no app, no cloud. Its only job is to answer
@@ -11,7 +11,7 @@ one question and produce one number.
 
 ## The one question
 
-> Can two ESP32s catch staged collapses in one real room **without spamming false alarms?**
+> Can one ESP32 catch staged collapses in one real room **without spamming false alarms?**
 
 Everything in this repo exists to answer that. The deliverable is not software — it is
 a **trustworthy false-alarm-per-week number**, alongside proof that staged falls are
@@ -36,6 +36,30 @@ also fires when a fan spins or the cat walks by is worse than useless: people mu
 and a muted safety device saves no one.
 
 ---
+
+## One board is the sensor
+
+CSI is measured on frames a radio **receives**, so the sensor needs a transmitter — but not
+one of ours. Your router already fills the room with frames; the ESP32 listens to that
+link, and a person moving through the path between them perturbs it measurably.
+
+```
+   [ROUTER]  · · · · · ·  person crosses here  · · · · · ·  [ESP32] --USB--> laptop
+   the transmitter                                          the sensor      the detector
+```
+
+The board also binds a UDP port and throws away whatever arrives: each datagram is one
+received frame, i.e. one CSI sample, so [`scripts/traffic.py`](scripts/traffic.py) turns the
+sample rate into a number we choose rather than one the network happens to give us
+(measured: **66 Hz**, versus ~12 Hz on the old two-board link).
+
+Firmware is in [`firmware/single_esp32_csi/`](firmware/single_esp32_csi/) — STA mode (router
+transmits), SoftAP mode (laptop transmits), or a passive sniffer. The full bring-up,
+placement guide and troubleshooting is [`docs/SINGLE_ESP32.md`](docs/SINGLE_ESP32.md).
+
+**Two boards still work** ([`docs/SENSETHROUGH.md`](docs/SENSETHROUGH.md)) — pass
+`--companion <port>` — but they are no longer required, and the second board was the source
+of most of the operational trouble.
 
 ## How it works (and what it does NOT need)
 
@@ -66,13 +90,12 @@ where the data comes from. The same brain runs on:
   with zero hardware.
 - **`ReplaySource`** — recorded log files. Deterministic; powers evaluation and doubles
   as a safe live-demo fallback.
-- **`SerialSource`** — the **live** ESP32 serial stream. Written **last**, when the
-  hardware is up.
+- **`LiveCSIReader`** — the **live** ESP32 serial stream (`source/live_reader.py`).
 
-**The payoff:** you build the whole pipeline before the hardware exists. When the ESP32s
-finally stream, the only new code is `serial_source.py` (implement `.stream()`) and
-`parser.py` (decode the real CSI line). Everything else already works and is already
-tested. The hardware is a plug-in, not a dependency.
+**The payoff:** the whole pipeline was built before the hardware existed, and when the board
+finally streamed, the only new code was the reader and the firmware. Everything downstream
+already worked and was already tested. The hardware is a plug-in, not a dependency — the
+same detector runs on one board, two boards, a recording, or a simulated room.
 
 ---
 
@@ -85,10 +108,12 @@ WISP/                              ← git repo = project root
 ├── config/pipeline.yaml          # all params, versioned (S2.7)
 ├── wisp/                          # the Python package (import wisp)
 │   ├── source/                   # S1.6 — the interface everything hides behind
-│   │   ├── base.py               #   CSISource: .stream() -> (timestamp, amplitude[])  [CONCRETE]
-│   │   ├── synthetic.py          #   fake room — build against this NOW
+│   │   ├── base.py               #   CSISource: .stream() -> (timestamp, amplitude[])
+│   │   ├── synthetic.py          #   fake room — no hardware needed
 │   │   ├── replay.py             #   read logged files
-│   │   └── serial_source.py      #   LIVE — write this LAST, when hardware streams
+│   │   ├── live_reader.py        #   LIVE — the single-board serial reader
+│   │   ├── traffic.py            #   UDP generator: sets the live sample rate
+│   │   └── serial_source.py      #   the original minimal live reader
 │   ├── ingest/                   # S1
 │   │   ├── parser.py             #   CSI_DATA line -> amplitude array
 │   │   └── logger.py             #   raw logger to disk (S1.5)
@@ -100,15 +125,20 @@ WISP/                              ← git repo = project root
 │   │   ├── rules.py              # S5.2 — sudden vs slow discriminators
 │   │   └── state_machine.py      # S6 — temporal logic, THE false-alarm killer
 │   └── evaluate/harness.py       # S9 — recall, false-alarms/week, latency  ← the deliverable
+├── firmware/single_esp32_csi/    # THE BOARD — ESP-IDF CSI streamer (STA/SoftAP/sniffer)
 ├── scripts/
+│   ├── serial_check.py           # is CSI flowing? the first thing to run
+│   ├── traffic.py                # generate the traffic the board measures
+│   ├── record.py                 # capture live CSI to a replayable log
 │   ├── calibrate.py              # fit a room profile from a recording
-│   ├── run_live.py               # detection loop -> one-line debug console
+│   ├── run_live.py               # detection loop -> one-line alert console (live or offline)
 │   └── evaluate.py               # replay + metrics
-└── tests/test_features.py        # S3.7 — features on a known sine/step
+├── server/                       # optional dashboard over the same pipeline
+└── tests/                        # 49 tests, no hardware required
 ```
 
-Only `source/base.py` is implemented (the abstract `CSISource`). Every other module is
-a documented stub raising `NotImplementedError`, filled in one at a time.
+Everything above is implemented and tested; the pipeline runs end to end with or without
+a board attached.
 
 ---
 
@@ -119,7 +149,9 @@ a documented stub raising `NotImplementedError`, filled in one at a time.
 | `source/base.py` | S1.6 | Abstract `CSISource.stream()` → `(timestamp, amplitude[])`. The one contract everything hides behind. **Done.** |
 | `source/synthetic.py` | S1.6 | Fake room. Emits **labeled** sequences: empty / walking / sudden collapse / slow collapse / optional periodic fan. |
 | `source/replay.py` | S1.6 | Replays a recorded log through the identical interface. Deterministic. |
-| `source/serial_source.py` | S1.6 | Live CSI from the RX ESP32 over pyserial. The only file that touches hardware. Written last. |
+| `source/live_reader.py` | S1.6 | **The live single-board reader.** AGC high-pass, subcarrier width lock, gap counting, measured packet rate, and the board's own CSI_STAT diagnostics. Its decode path is a pure generator over text lines, so all of it is tested without hardware. |
+| `source/traffic.py` | — | UDP generator aimed at the firmware's sink: makes the CSI sample rate a number you choose. |
+| `source/serial_source.py` | S1.6 | The original minimal pyserial reader, kept for simple captures. |
 | `ingest/parser.py` | S1 | Parse a `CSI_DATA` serial line → per-subcarrier amplitude array (`sqrt(i²+q²)`). Pure, unit-testable. |
 | `ingest/logger.py` | S1.5 | Raw CSI logger to disk, continuous. **Do not skip** — every hour logged early is irreplaceable data and your demo safety net. |
 | `preprocess/clean.py` | S2 | Drop null/guard + dead subcarriers, Hampel outlier rejection, band-pass. Amplitude only (phase skipped for MVP). Rolling short (~1s) + long (~3–5s) windows. |
@@ -184,7 +216,7 @@ python scripts/calibrate.py     # learn this room's normal -> room_profile.pkl
 python scripts/run_live.py      # the one-line alert console
 python scripts/evaluate.py      # the Phase-0 gate numbers (recall / false-alarms per week)
 python scripts/plot_run.py      # SEE it: saves run.png (motion + sharpness + alerts)
-pytest -q                       # 20 tests
+pytest -q                       # 49 tests
 ```
 
 ### Live dashboard (optional demo layer)
@@ -202,19 +234,31 @@ python server/app.py                 # use the ESP32 if it's streaming, else fal
 
 See [`server/README.md`](server/README.md) for the fallback chain, flags, and HTTP API.
 
-> **Running it live on the two ESP32s?** The full live-system guide —
-> hardware/USB bring-up, the 2-board reader, calibration & detection tuning, board
-> placement, and troubleshooting the radio link — is in
-> [`docs/SENSETHROUGH.md`](docs/SENSETHROUGH.md).
+### Live, on one ESP32
 
-### Live hardware (after Milestone 1)
+Flash [`firmware/single_esp32_csi/`](firmware/single_esp32_csi/), then work through these in
+order — each step either passes or tells you exactly what is wrong:
 
-Once the RX ESP32 streams CSI to serial, swap the source — nothing downstream changes:
-
-```python
-from wisp.source.serial_source import SerialSource
-source = SerialSource(port="COM5", baud=921600)   # or /dev/ttyUSB0 on Linux
 ```
+python scripts/serial_check.py --port COM5 --baud 921600      # 1. is CSI flowing?
+python scripts/traffic.py --host <board-ip> --hz 50           # 2. set the sample rate
+python scripts/run_live.py --serial COM5 --baud 921600        # 3. calibrate + alert console
+python server/app.py --serial COM5 --baud 921600              # 4. the dashboard
+```
+
+Step 3 prints the number that decides everything:
+
+```
+still->occupied separation: 9.2x  [EXCELLENT]      # >=2x usable, <2x reposition the board
+```
+
+Below 2x the still and active levels overlap, so the room's own quiet looks like a collapse
+and **no threshold tuning helps** — the geometry has to change. Measured 1.6x on a bad
+placement here, and it produced a confident false "slow collapse" within a minute.
+
+> Full bring-up, placement guide, the numbers to watch and every failure mode we hit:
+> **[`docs/SINGLE_ESP32.md`](docs/SINGLE_ESP32.md)**. For the two-board rig, see
+> [`docs/SENSETHROUGH.md`](docs/SENSETHROUGH.md).
 
 ## The MVP interface
 
@@ -249,13 +293,17 @@ Two things not to cut, ever, even in MVP:
 
 ## Hardware (Phase 0)
 
-- 2 ESP32 boards in hand (RX = WROOM-32, TX = ESP-32S) + 1 spare, 2 data USB cables.
-- Compute node = a laptop. No Raspberry Pi yet.
-- Firmware: ESP-IDF, `active_ap` → RX, `active_sta` → TX (matching SSID/channel/baud).
-  **Milestone 1** = CSI streams to serial and reacts to a hand-wave.
-- Fixed rig: both boards taped/bracketed so they cannot move for the whole test.
-  Geometry (TX–RX distance, heights, orientation, room sketch, photo) documented once.
-- The firmware/IDF version fight is the highest-risk, most time-consuming hardware task.
+- **1 ESP32** (WROOM-32 or ESP-32S) and one **data** USB cable. A second board is optional.
+- A **transmitter you already own**: the router, a phone hotspot, or the laptop itself.
+- Compute node = the laptop the board is plugged into. No Raspberry Pi.
+- Firmware: [`firmware/single_esp32_csi/`](firmware/single_esp32_csi/), ESP-IDF v4.3+.
+  **Milestone 1** = `scripts/serial_check.py` reports CSI flowing at a stable width.
+- Fixed rig: the board taped or bracketed so it cannot move for the whole test. Moving it
+  changes the channel more than a person does. Geometry documented once (board-to-router
+  distance, heights, room sketch, photo).
+
+Measured on the first real bring-up: **62 subcarriers, stable width, 33 Hz self-ping /
+66 Hz with the traffic generator, 0 dropped packets.**
 
 ## References
 

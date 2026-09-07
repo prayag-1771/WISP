@@ -17,3 +17,9 @@ profiles/
 # generated plot output (reproducible via scripts/plot_run.py)
 run.png
 *.png
+
+# local scratch (build scripts here can contain Wi-Fi credentials)
+.scratch/
+
+# Windows shortcuts are machine-local, not project files
+*.lnk
