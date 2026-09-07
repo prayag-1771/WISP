@@ -46,6 +46,9 @@ class DetectionStateMachine:
     slow_confirm_s       stillness needed to confirm a SLOW collapse
     recent_activity_s    how far back "was recently occupied" looks
     debounce_s           quiet time after an alert before the machine can re-arm
+    min_active_s         sustained activity required before any collapse can confirm
+    gap_reset_s          a data dropout longer than this resets the machine (0 = off).
+                         Set it live: missing CSI must not be read as a still room.
     """
 
     still_threshold: float
@@ -56,6 +59,7 @@ class DetectionStateMachine:
     recent_activity_s: float = 10.0
     debounce_s: float = 5.0
     min_active_s: float = 0.0        # a collapse requires this much sustained activity first
+    gap_reset_s: float = 0.0         # a data dropout longer than this discards the pattern
 
     # ---- internal state
     _state: str = "NORMAL"
@@ -64,6 +68,8 @@ class DetectionStateMachine:
     _still_since: Optional[float] = None         # when the current stillness began
     _peak_sharp: float = 0.0                     # peak sharpness during the disturbance
     _last_alert_t: Optional[float] = None
+    _last_update_t: Optional[float] = None       # last window seen, for gap detection
+    gaps_seen: int = 0
     audit_log: List[tuple] = field(default_factory=list)
 
     @property
@@ -80,6 +86,23 @@ class DetectionStateMachine:
         """Advance one step. Returns an Alert when a collapse is confirmed, else None."""
         motion = features["motion_intensity"]
         sharp = features["transient_sharpness"]
+
+        # --- data gap: no CSI is not the same as no motion.
+        # A one-board sensor rides on someone else's traffic (the router's, the laptop's),
+        # and when that pauses the stream simply stops. Timestamps then jump, and every
+        # elapsed-time test in this machine — stillness, recent activity — would read the
+        # dropout as a room that went quiet and stayed quiet: a textbook false "slow
+        # collapse" manufactured out of missing data. So a gap discards the pattern in
+        # progress and starts over from NORMAL. We know nothing about what happened during
+        # the gap, and inventing a fall is the worst possible guess.
+        if (self.gap_reset_s > 0 and self._last_update_t is not None
+                and timestamp - self._last_update_t > self.gap_reset_s):
+            self.gaps_seen += 1
+            self._reset_dynamic(timestamp)
+            self._last_motion_t = None
+            self._last_alert_t = None
+            self._transition(timestamp, "NORMAL")
+        self._last_update_t = timestamp
 
         # --- debounce: stay quiet after an alert until motion clearly resumes
         if self._last_alert_t is not None:

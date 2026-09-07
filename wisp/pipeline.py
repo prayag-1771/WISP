@@ -32,6 +32,9 @@ def _state_machine(profile: RoomProfile) -> DetectionStateMachine:
         recent_activity_s=profile.recent_activity_s,
         debounce_s=profile.debounce_s,
         min_active_s=profile.min_active_s,
+        # getattr: profiles are pickles that outlive the code that wrote them, so a field
+        # added later must not break loading a room profile fitted by an older version.
+        gap_reset_s=getattr(profile, "gap_reset_s", 0.0),
     )
 
 
