@@ -1,0 +1,31 @@
+# Defaults for the single-ESP32 CSI streamer. `idf.py build` applies these on a fresh
+# checkout; `idf.py menuconfig` overrides them into sdkconfig (which is gitignored).
+
+# THE one flag you cannot forget. Without CSI compiled into the Wi-Fi library,
+# esp_wifi_set_csi() fails and the board reboot-loops on startup. (IDF v5 renamed this to
+# CONFIG_ESP_WIFI_CSI_ENABLED and migrates the old name automatically, so this one line
+# works on both v4.3 and v5.x.)
+CONFIG_ESP32_WIFI_CSI_ENABLED=y
+
+# Serial throughput is the real cap on packet rate, not the radio. One LLTF-only CSI line
+# is ~420 bytes, so 115200 baud (11.5 kB/s) tops out near 25 Hz before the UART becomes
+# the bottleneck and the firmware starts dropping queued packets. 921600 leaves headroom
+# for 100 Hz. Drop to 115200 only if your USB-serial link is unreliable at speed — and
+# expect the rate ceiling that comes with it.
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
+# 1 ms tick: the self-ping interval and the printing task both want finer scheduling than
+# the default 100 Hz tick can express.
+CONFIG_FREERTOS_HZ=1000
+
+# Receive-side buffers: CSI is generated per received frame, and starving the Wi-Fi driver
+# of RX buffers shows up as an uneven packet rate (which reads as fake motion).
+CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP32_WIFI_RX_BA_WIN=16
+
+# Keep the log quiet: every log line shares the UART with the CSI stream.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096

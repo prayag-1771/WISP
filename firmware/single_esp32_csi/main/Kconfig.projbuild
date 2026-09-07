@@ -1,0 +1,119 @@
+menu "SenseThrough single-ESP32 CSI"
+
+choice WISP_LINK_MODE
+    prompt "Link mode (where the transmitted frames come from)"
+    default WISP_LINK_MODE_STA
+    help
+        One ESP32 measures CSI only on frames it RECEIVES, so pick what transmits:
+
+        STA     - join an existing Wi-Fi network; the ROUTER is the transmitter.
+                  Traffic comes from the laptop (scripts/traffic.py, exact rate) and/or
+                  the board pinging its own gateway. Recommended.
+        SOFTAP  - the board is the access point; a laptop/phone joins it and sends the
+                  traffic. No router or credentials needed.
+        SNIFFER - fully passive on one channel; CSI from beacons already on the air
+                  (~10 Hz, not under our control). No association at all.
+
+config WISP_LINK_MODE_STA
+    bool "STA — join an existing network (router is the transmitter)"
+
+config WISP_LINK_MODE_SOFTAP
+    bool "SoftAP — the board is the AP, a laptop joins and sends traffic"
+
+config WISP_LINK_MODE_SNIFFER
+    bool "Sniffer — passive, CSI from whatever is on air"
+
+endchoice
+
+config WISP_WIFI_SSID
+    string "STA: SSID to join"
+    default "myrouter"
+    depends on WISP_LINK_MODE_STA
+
+config WISP_WIFI_PASSWORD
+    string "STA: password"
+    default "mypassword"
+    depends on WISP_LINK_MODE_STA
+
+config WISP_SOFTAP_SSID
+    string "SoftAP: SSID to publish"
+    default "sensethrough"
+    depends on WISP_LINK_MODE_SOFTAP
+
+config WISP_SOFTAP_PASSWORD
+    string "SoftAP: password (blank or <8 chars = open network)"
+    default "sensethrough"
+    depends on WISP_LINK_MODE_SOFTAP
+
+config WISP_SOFTAP_CHANNEL
+    int "SoftAP: channel"
+    range 1 13
+    default 6
+    depends on WISP_LINK_MODE_SOFTAP
+
+config WISP_SNIFFER_CHANNEL
+    int "Sniffer: channel to sit on"
+    range 1 13
+    default 6
+    depends on WISP_LINK_MODE_SNIFFER
+    help
+        Must match the channel of the AP you want to hear. Check your router settings.
+
+config WISP_MAC_FILTER
+    string "Only emit CSI from this transmitter MAC (blank = auto)"
+    default ""
+    help
+        CSI from several transmitters mixed into one signal is meaningless — each sender
+        is a different radio channel. In STA/SoftAP mode this is set automatically to the
+        peer we associated with, so leave it blank. In SNIFFER mode set it to one AP BSSID
+        (aa:bb:cc:dd:ee:ff), otherwise every AP in range pollutes the motion signal.
+
+config WISP_CSI_LLTF_ONLY
+    bool "LLTF subcarriers only (constant width, 1/3 the UART bytes)"
+    default y
+    help
+        Strongly recommended. LLTF-only CSI has a CONSTANT subcarrier count, which is what
+        the fixed-width room mask wants, and it cuts each serial line to about a third —
+        the UART, not the radio, is what caps the packet rate. Enable HT-LTF only if you
+        specifically want the extra subcarriers and have the baud budget for them.
+
+config WISP_UDP_PORT
+    int "UDP sink port (where scripts/traffic.py aims)"
+    range 1024 65535
+    default 8888
+    help
+        The board binds this port and discards whatever arrives. The payload is irrelevant:
+        each datagram is one received Wi-Fi frame, i.e. one CSI sample. This is what makes
+        the packet rate a number you choose instead of one you hope for.
+
+config WISP_SELF_PING
+    bool "Also ping the gateway to generate traffic without the laptop"
+    default y
+    depends on WISP_LINK_MODE_STA
+    help
+        Each echo reply is a frame from the router to us, i.e. one CSI sample — so the
+        board still streams CSI when nothing else is running. Routers rate-limit ICMP, so
+        this is a floor, not a substitute for the UDP generator.
+
+config WISP_PING_INTERVAL_MS
+    int "Self-ping interval (ms)"
+    range 10 1000
+    default 30
+    help
+        30 ms is about 33 Hz if the router keeps up. Below ~20 ms most routers start
+        dropping or coalescing replies.
+
+config WISP_QUEUE_DEPTH
+    int "CSI queue depth (packets)"
+    range 4 64
+    default 16
+    help
+        Buffers CSI between the Wi-Fi callback and the printing task. Deeper rides out UART
+        hiccups at the cost of RAM (~400 bytes each) and of latency when it is full.
+
+config WISP_STAT_INTERVAL_S
+    int "CSI_STAT diagnostic interval (s)"
+    range 1 60
+    default 5
+
+endmenu
