@@ -7,11 +7,20 @@
 # works on both v4.3 and v5.x.)
 CONFIG_ESP32_WIFI_CSI_ENABLED=y
 
-# Serial throughput is the real cap on packet rate, not the radio. One LLTF-only CSI line
-# is ~420 bytes, so 115200 baud (11.5 kB/s) tops out near 25 Hz before the UART becomes
-# the bottleneck and the firmware starts dropping queued packets. 921600 leaves headroom
-# for 100 Hz. Drop to 115200 only if your USB-serial link is unreliable at speed — and
-# expect the rate ceiling that comes with it.
+# Serial throughput, not the radio, is the real cap on packet rate. One LLTF-only CSI line
+# is ~500 bytes, so 115200 baud (11.5 kB/s) tops out near 20 Hz — and past that the board
+# starts DROPPING queued CSI, which is worse than a lower rate because it makes the
+# sampling uneven (measured on this rig: 24 Hz produced, 59 of 257 packets dropped).
+# 921600 carries 100 Hz with room to spare.
+#
+# ESP_CONSOLE_UART_CUSTOM is required, not optional: in IDF the baud symbol only carries a
+# prompt when CUSTOM is selected, and kconfiglib silently ignores values for symbols that
+# have no prompt. Set the baud alone and it stays 115200 with no warning whatsoever - which
+# then looks exactly like line corruption when you read at the rate you thought you set.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=1
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=3
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 
 # 1 ms tick: the self-ping interval and the printing task both want finer scheduling than

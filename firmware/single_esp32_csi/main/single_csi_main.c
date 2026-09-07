@@ -333,9 +333,26 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        /* The reason code is the difference between ten minutes and an afternoon: a wrong
+         * password, an AP that cannot be seen, and an AP that refuses us all look identical
+         * from outside, and all three are common on a first bring-up. */
+        wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
+        uint8_t reason = e ? e->reason : 0;
+        const char *why = "see esp_wifi_types.h";
+        switch (reason) {
+            case WIFI_REASON_AUTH_EXPIRE:            why = "auth expired"; break;
+            case WIFI_REASON_ASSOC_EXPIRE:           why = "assoc expired"; break;
+            case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: why = "WRONG PASSWORD (4-way timeout)"; break;
+            case WIFI_REASON_NO_AP_FOUND:            why = "SSID NOT FOUND (name/2.4GHz/range)"; break;
+            case WIFI_REASON_AUTH_FAIL:              why = "AUTH REFUSED (password or WPA3/PMF)"; break;
+            case WIFI_REASON_ASSOC_FAIL:             why = "assoc refused (AP full?)"; break;
+            case WIFI_REASON_HANDSHAKE_TIMEOUT:      why = "handshake timeout"; break;
+            case WIFI_REASON_CONNECTION_FAIL:        why = "connection failed"; break;
+            default: break;
+        }
         s_link_up = false;
         s_filter_on = false;
-        printf("CSI_LINK,state=disconnected\n");
+        printf("CSI_LINK,state=disconnected,reason=%u,why=%s\n", reason, why);
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
@@ -371,10 +388,24 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     }
 }
 
-static void wifi_common_init(void)
+/* Which default network interface to create, if any. */
+typedef enum { NETIF_NONE = 0, NETIF_STA, NETIF_AP } netif_kind_t;
+
+static void wifi_common_init(netif_kind_t netif_kind)
 {
+    /* ORDER MATTERS, and getting it wrong fails in a way that looks like someone else's
+     * fault: esp_netif_create_default_wifi_*() must come AFTER esp_netif_init() and the
+     * default event loop exist, because that is when it attaches the handlers that start
+     * the DHCP client. Create it too early and the board associates perfectly, reports a
+     * healthy RSSI, and then sits at 0.0.0.0 forever with no error anywhere. (Observed on
+     * this rig before this order was fixed.) */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    if (netif_kind == NETIF_STA) {
+        esp_netif_create_default_wifi_sta();
+    } else if (netif_kind == NETIF_AP) {
+        esp_netif_create_default_wifi_ap();
+    }
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
@@ -387,11 +418,19 @@ static void wifi_common_init(void)
 #if CONFIG_WISP_LINK_MODE_STA
 static void start_sta(void)
 {
-    esp_netif_create_default_wifi_sta();
-    wifi_common_init();
+    wifi_common_init(NETIF_STA);
     wifi_config_t wc = { 0 };
     strlcpy((char *)wc.sta.ssid, CONFIG_WISP_WIFI_SSID, sizeof(wc.sta.ssid));
     strlcpy((char *)wc.sta.password, CONFIG_WISP_WIFI_PASSWORD, sizeof(wc.sta.password));
+    /* Phone hotspots and current routers frequently require Protected Management Frames
+     * (WPA3, or WPA2 with PMF required). Declaring ourselves PMF-capable lets those APs
+     * accept us; leaving it out is a silent auth failure that looks like a bad password. */
+    wc.sta.pmf_cfg.capable  = true;
+    wc.sta.pmf_cfg.required = false;
+    /* Scan every channel and pick the strongest match: a hotspot that moved channel since
+     * the last boot is otherwise simply "not found". */
+    wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -406,8 +445,7 @@ static void start_sta(void)
 #if CONFIG_WISP_LINK_MODE_SOFTAP
 static void start_softap(void)
 {
-    esp_netif_create_default_wifi_ap();
-    wifi_common_init();
+    wifi_common_init(NETIF_AP);
     wifi_config_t wc = { 0 };
     strlcpy((char *)wc.ap.ssid, CONFIG_WISP_SOFTAP_SSID, sizeof(wc.ap.ssid));
     strlcpy((char *)wc.ap.password, CONFIG_WISP_SOFTAP_PASSWORD, sizeof(wc.ap.password));
@@ -437,7 +475,7 @@ static void promisc_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) { /* CSI 
 
 static void start_sniffer(void)
 {
-    wifi_common_init();
+    wifi_common_init(NETIF_NONE);   /* no IP stack: promiscuous capture needs no address */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
