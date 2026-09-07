@@ -23,17 +23,17 @@ from __future__ import annotations
 import glob
 import threading
 import time
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from wisp.calibrate.profile import RoomProfile
-from wisp.ingest.parser import parse_csi_line
 from wisp.pipeline import detection_telemetry
 from wisp.source.base import CSISource
+from wisp.source.live_reader import LinkStats, LiveCSIReader, measure_rate, open_runmode
 from wisp.source.replay import ReplaySource
-from wisp.source.serial_source import SerialSource
 from wisp.source.synthetic import SyntheticSource
+from wisp.source.traffic import UdpTrafficGenerator
 
 # ------------------------------------------------------------------ config
 
@@ -58,11 +58,19 @@ class EngineOptions:
     probe_s: float = 6.0                  # how long to wait for a CSI line before giving up
     csi_bench: Optional[str] = None       # path to CSI-Bench .h5 file/dir (real-data fallback)
     replay: Optional[str] = None          # path to a recorded RawLogger CSV (real-data fallback)
-    companion_port: Optional[str] = None  # 2nd ESP32 (TX) port to hold open so the link stays up
+    companion_port: Optional[str] = None  # legacy 2-board rig: TX port to hold open (single-board leaves this None)
+    # traffic generation (single board) — the board measures CSI on frames it RECEIVES, so
+    # with one ESP32 the sample rate is set by whoever transmits. We transmit: UDP datagrams
+    # at a chosen rate to the firmware's sink. Without this the rate is the router's whim.
+    traffic_hz: float = 50.0              # 0 disables the generator
+    traffic_port: int = 8888              # must match CONFIG_WISP_UDP_PORT
+    traffic_host: Optional[str] = None    # None => auto-discover from the board's CSI_INFO line
     # calibration
     profile_path: str = "room_profile.pkl"
     calibrate_s: float = 20.0             # seconds of live "normal" to fit a live profile
     rate_hz: float = 50.0                 # synthetic sample rate / nominal live rate
+    auto_rate: bool = True                # live: size windows from the MEASURED packet rate
+    gap_reset_s: float = 3.0              # live: a CSI dropout longer than this resets detection
     smooth_windows: int = 9               # live: median-filter features over N windows (kills noise-driven false alarms)
     # absolute threshold overrides (live): pin the still/occupied/sharp lines to measured
     # values instead of calibration percentiles. Needed when the resting noise floor sits
@@ -94,7 +102,18 @@ class _SourceChoice:
 # ------------------------------------------------------------------ probing / selection
 
 def _autodetect_ports() -> List[str]:
-    """Linux/WSL serial devices the ESP32 typically shows up as."""
+    """Serial devices an ESP32 plausibly shows up as, on any host.
+
+    pyserial enumerates properly on Windows (where ports are COM3, COM7, ... with no path
+    to glob); the /dev globs are the Linux/WSL fallback for when pyserial is missing.
+    """
+    try:
+        from serial.tools import list_ports
+        ports = [p.device for p in list_ports.comports()]
+        if ports:
+            return sorted(ports)
+    except Exception:
+        pass
     return sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
 
 
@@ -104,19 +123,7 @@ def probe_serial(port: str, baud: int, probe_s: float, prefix: str = "CSI_DATA")
     Safe on machines with no hardware / no pyserial: any failure => False (=> fallback).
     """
     try:
-        import serial  # pyserial, lazy
-    except Exception:
-        return False
-    try:
-        ser = serial.Serial()
-        ser.port = port
-        ser.baudrate = baud
-        ser.timeout = 0.5
-        ser.dtr = False   # don't reset the ESP32 on open (RTS->EN, DTR->GPIO0)
-        ser.rts = False
-        ser.open()
-        ser.dtr = False
-        ser.rts = False
+        ser = open_runmode(port, baud, timeout=0.5)
         try:
             deadline = time.time() + probe_s
             while time.time() < deadline:
@@ -128,23 +135,6 @@ def probe_serial(port: str, baud: int, probe_s: float, prefix: str = "CSI_DATA")
     except Exception:
         return False
     return False
-
-
-def _open_runmode(port: str, baud: int, timeout: float = 0.1):
-    """Open a serial port WITHOUT knocking the ESP32 into download mode: DTR low keeps GPIO0
-    high (normal boot) and RTS low keeps EN high (not held in reset). The board still resets
-    once on open, then runs its firmware."""
-    import serial
-    s = serial.Serial()
-    s.port = port
-    s.baudrate = baud
-    s.timeout = timeout
-    s.dtr = False
-    s.rts = False
-    s.open()
-    s.dtr = False
-    s.rts = False
-    return s
 
 
 class _ListSource(CSISource):
@@ -167,90 +157,45 @@ class _GenSource(CSISource):
         yield from self._gen
 
 
-class _LiveTwoBoard(CSISource):
-    """Live 2-board reader. Opens the RECEIVER port and, if given, also HOLDS the TRANSMITTER
-    (companion) port open — both in run-mode — so the two ESP32s boot in sync and the Wi-Fi
-    link stays up. Opening either port resets that board once; holding both open is what keeps
-    the CSI rate stable (opening only one, or at different times, drops the link). Yields
-    (t, amp) from the receiver, skipping boot/log chatter and malformed lines.
-    """
+def _live_reader(opts: EngineOptions, port: str) -> LiveCSIReader:
+    """The live source for either rig: one board, or one board plus a held-open companion."""
+    return LiveCSIReader(
+        port,
+        baud=opts.baud,
+        companion_port=opts.companion_port,
+        gap_s=max(1.0, opts.gap_reset_s),
+    )
 
-    def __init__(self, reader_port: str, companion_port, baud: int, prefix: str = "CSI_DATA") -> None:
-        self.reader_port = reader_port
-        self.companion_port = companion_port
-        self.baud = baud
-        self.prefix = prefix
 
-    def stream(self):
-        companion = _open_runmode(self.companion_port, self.baud) if self.companion_port else None
-        ser = _open_runmode(self.reader_port, self.baud)
-        t0 = time.time()
-        # ESP32 CSI packets arrive with different subcarrier counts (HT20/HT40, LLTF vs
-        # HT-LTF). Lock onto the DOMINANT width from the first batch and skip the rest, so the
-        # fixed-width room mask always matches — otherwise preprocessing IndexErrors and the
-        # whole detection loop dies mid-stream.
-        buf = []
-        width = None
-        baseline = None  # slow EMA of the packet mean -> removes AGC drift, keeps fast motion
-        try:
-            while True:
-                raw = ser.readline().decode("ascii", errors="ignore").strip()
-                if not raw or not raw.startswith(self.prefix):
-                    continue
-                try:
-                    amp = parse_csi_line(raw)
-                except ValueError:
-                    continue
-                # High-pass AGC removal: divide by a SLOW baseline (not the packet's own mean),
-                # so slow gain drift cancels but a body moving (fast scale change) survives.
-                pm = float(amp.mean())
-                if pm > 1e-6:
-                    baseline = pm if baseline is None else (0.97 * baseline + 0.03 * pm)
-                    amp = amp / baseline
-                rec = (time.time() - t0, amp)
-                if width is None:                       # still learning the dominant width
-                    buf.append(rec)
-                    if len(buf) >= 40:
-                        width = Counter(a.size for _, a in buf).most_common(1)[0][0]
-                        for r in buf:
-                            if r[1].size == width:
-                                yield r
-                        buf = []
-                    continue
-                if amp.size != width:                   # skip odd-width packets
-                    continue
-                yield rec
-        finally:
-            ser.close()
-            if companion is not None:
-                companion.close()
+def _live_note(opts: EngineOptions, port: str) -> str:
+    if opts.companion_port:
+        return (f"live CSI from the ESP32 on {port} "
+                f"(2-board rig, TX held open on {opts.companion_port})")
+    who = "the router" if opts.traffic_host is None else opts.traffic_host
+    traffic = (f"; traffic generator {opts.traffic_hz:g} Hz -> {who}:{opts.traffic_port}"
+               if opts.traffic_hz > 0 else "; traffic generator off")
+    return f"live CSI from the single ESP32 on {port}{traffic}"
 
 
 def choose_source(opts: EngineOptions) -> _SourceChoice:
     """Walk the fallback chain and return the first source that is actually available."""
-    # 1) LIVE ESP32.
+    # 1) LIVE ESP32 — one board is the whole sensor; a companion port is the legacy 2-board rig.
     if opts.probe_serial:
         # An explicit --serial port is TRUSTED (no probe): probing means an extra open, and
-        # each open resets the board and disrupts the 2-board link. Autodetected ports are
-        # still probed, to pick the one actually streaming CSI.
-        if opts.serial_port:
-            tx = f" (+ TX held on {opts.companion_port})" if opts.companion_port else ""
+        # every open resets the board. Autodetected ports are still probed, to pick the one
+        # actually streaming CSI rather than a Bluetooth or debug port that happens to exist.
+        port = opts.serial_port
+        if not port:
+            port = next((p for p in _autodetect_ports()
+                         if probe_serial(p, opts.baud, opts.probe_s)), None)
+        if port:
             return _SourceChoice(
-                source=SerialSource(opts.serial_port, opts.baud),
+                source=_live_reader(opts, port),
                 mode="LIVE", live=True, kind="serial",
-                label=f"ESP32 · {opts.serial_port}",
-                note=f"live CSI from the ESP32 on {opts.serial_port}{tx}",
+                label=f"ESP32 · {port}" + (" (2-board)" if opts.companion_port else " (single board)"),
+                note=_live_note(opts, port),
                 sample_rate_hz=opts.rate_hz,
             )
-        for port in _autodetect_ports():
-            if probe_serial(port, opts.baud, opts.probe_s):
-                return _SourceChoice(
-                    source=SerialSource(port, opts.baud),
-                    mode="LIVE", live=True, kind="serial",
-                    label=f"ESP32 · {port}",
-                    note=f"live CSI streaming from the ESP32 on {port}",
-                    sample_rate_hz=opts.rate_hz,
-                )
         tried = ", ".join(_autodetect_ports()) or "no serial ports found"
         fallback_note = f"no live ESP32 CSI ({tried}) — running on fallback data"
     else:
@@ -291,20 +236,15 @@ def choose_source(opts: EngineOptions) -> _SourceChoice:
 # ------------------------------------------------------------------ calibration
 
 def build_profile(opts: EngineOptions, choice: _SourceChoice) -> RoomProfile:
-    """Load a saved profile if present, else fit one appropriate to the chosen source."""
+    """Load a saved profile if present, else fit one for a FALLBACK source."""
     import os
 
     if os.path.exists(opts.profile_path):
         return RoomProfile.load(opts.profile_path)
 
-    if choice.live:
-        # Calibrate on the room's OWN live normal (room must be behaving normally now).
-        n = max(200, int(opts.calibrate_s * opts.rate_hz))
-        cal = SerialSource(choice.source.port, choice.source.baud, max_packets=n)  # type: ignore[attr-defined]
-        profile = RoomProfile.fit(cal, sample_rate_hz=opts.rate_hz)
-        profile.save(opts.profile_path)
-        return profile
-
+    # Fallback sources only — a live board calibrates inside _run_live, on the same open
+    # stream it then detects on (one board reset, one continuous read).
+    #
     # Fallback sources: calibrate on synthetic normal at the same rate (matches the
     # synthetic demo exactly; a reasonable default for replay code-path demos too).
     profile = RoomProfile.fit(
@@ -328,6 +268,10 @@ class MonitorEngine:
         self.choice: Optional[_SourceChoice] = None
         self.profile: Optional[RoomProfile] = None
         self._calibrating = True
+        # live link health, filled in by the reader as the stream is consumed
+        self.link = LinkStats()
+        self.traffic: Optional[UdpTrafficGenerator] = None
+        self.rate_hz = self.opts.rate_hz        # replaced by the MEASURED rate once live
 
         self._started_at = 0.0
         self._last_update = 0.0
@@ -356,6 +300,36 @@ class MonitorEngine:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.traffic is not None:
+            self.traffic.stop()
+
+    # -- single-board traffic ----------------------------------------------
+    def _on_board_info(self, info: Dict[str, str]) -> None:
+        """Called for each CSI_INFO/CSI_STAT/CSI_LINK line the board prints.
+
+        The board announces its own IP, which is exactly what the traffic generator needs
+        to aim at — so plugging in one ESP32 and starting the server is the whole setup, no
+        address to look up and type in.
+        """
+        ip = info.get("ip")
+        if ip and ip != "0.0.0.0":
+            self._start_traffic(ip)
+
+    def _start_traffic(self, host: str) -> None:
+        """Start (or re-aim) the UDP generator that sets the CSI sample rate.
+
+        Skipped on the 2-board rig, where the companion board is the transmitter, and
+        skipped when --traffic-hz is 0 (self-ping or sniffer mode carries the link instead).
+        """
+        if self.opts.traffic_hz <= 0 or self.opts.companion_port:
+            return
+        with self._lock:
+            if self.traffic is not None:
+                if self.traffic.host == host and self.traffic.running:
+                    return
+                self.traffic.stop()
+            self.traffic = UdpTrafficGenerator(
+                host, port=self.opts.traffic_port, hz=self.opts.traffic_hz).start()
 
     def _run(self) -> None:
         assert self.choice is not None
@@ -370,11 +344,18 @@ class MonitorEngine:
                 self._stream_ended = True
 
     def _run_live(self) -> None:
-        """ONE continuous serial read, shared by calibration + detection (a single board
-        reset), with the transmitter held open so the 2-board link stays up. First CSI
-        arrives ~15s after open while the boards boot and associate."""
-        reader_port = self.choice.source.port  # type: ignore[attr-defined]
-        gen = _LiveTwoBoard(reader_port, self.opts.companion_port, self.opts.baud).stream()
+        """ONE continuous serial read, shared by calibration + detection, so the board is
+        reset once and never mid-run. On the single-board sensor the first CSI arrives a few
+        seconds after open, once the board has associated and traffic is flowing; on the
+        legacy 2-board rig it takes ~15 s for both boards to boot and link up."""
+        reader: LiveCSIReader = self.choice.source          # type: ignore[assignment]
+        reader.stats = self.link
+        reader.on_info = self._on_board_info                # discovers the IP -> starts traffic
+        # A fixed traffic_host needs no discovery, so start generating immediately: with one
+        # board, nothing transmits until we do, which means no CSI to calibrate on.
+        if self.opts.traffic_host and not self.opts.companion_port:
+            self._start_traffic(self.opts.traffic_host)
+        gen = reader.stream()
 
         # calibrate on the room's own live normal (keep the room normal during this window)
         n = max(120, int(self.opts.calibrate_s * self.opts.rate_hz))
@@ -387,18 +368,28 @@ class MonitorEngine:
                 self._last_update = time.time()
             if len(cal) >= n:
                 break
+
+        # Size the windows from the rate the link ACTUALLY delivered, not the configured
+        # guess. With one board the rate is whatever the transmitter and the UART settled on
+        # (~30 Hz on a self-ping, exactly --traffic-hz with the generator, ~10 Hz sniffing);
+        # calling that 50 Hz would make every "1 second" window some other length, and every
+        # timing in the state machine wrong with it.
+        self.rate_hz = measure_rate(cal, default=self.opts.rate_hz) if self.opts.auto_rate \
+            else self.opts.rate_hz
+
         # Conservative thresholds + timings for a noisy live signal: a wide dead-band (only
-        # the bottom 10% of motion counts as "still", only the top 10% as "occupied", only
+        # the bottom 25% of motion counts as "still", only the top 20% as "occupied", only
         # extreme spikes as an impact) plus long sustained-stillness confirmation, so ordinary
         # radio noise can't walk the state machine into a false collapse.
         self.profile = RoomProfile.fit(
-            _ListSource(cal), sample_rate_hz=self.opts.rate_hz,
+            _ListSource(cal), sample_rate_hz=self.rate_hz,
             still_pct=25.0, occupied_pct=80.0, sharp_pct=97.0,
             still_abs=self.opts.still_abs, occupied_abs=self.opts.occupied_abs,
             sharp_abs=self.opts.sharp_abs,
             confirm_s=self.opts.confirm_s, slow_confirm_s=25.0,
             recent_activity_s=12.0, debounce_s=8.0,
             min_active_s=self.opts.min_active_s,
+            gap_reset_s=self.opts.gap_reset_s,
         )
         self.profile.save(self.opts.profile_path)
         with self._lock:
@@ -523,6 +514,36 @@ class MonitorEngine:
             elif self._resolution == "cancelled" and now - self._last_resolved_at >= 2.0:
                 self._resolution = None
 
+    def _link_snapshot(self) -> Optional[dict]:
+        """The radio's own view of itself — only meaningful for a live board.
+
+        A single-board sensor can look perfectly healthy on screen while quietly running at
+        4 Hz through a router that is rate-limiting us, or dropping a third of its packets
+        into a full UART. Both destroy detection and neither shows up as an error, so the
+        numbers that reveal them belong on the dashboard, not in a log nobody reads.
+        """
+        c = self.choice
+        if c is None or not c.live:
+            return None
+        st = self.link
+        return {
+            "board_ip": st.board_ip,
+            "state": st.link_state,
+            "rssi": st.rssi,
+            "packets": st.packets,
+            "measured_rate_hz": (round(st.measured_rate_hz, 1)
+                                 if st.measured_rate_hz is not None else None),
+            "firmware_rate_hz": st.firmware_rate_hz,
+            "firmware_dropped": st.firmware_dropped,   # CSI the board could not print in time
+            "gaps": st.gaps,
+            "longest_gap_s": round(st.longest_gap_s, 1),
+            "subcarriers": st.width,
+            "malformed": st.malformed,
+            "width_skipped": st.width_skipped,
+            "two_board": bool(self.opts.companion_port),
+            "traffic": None if self.traffic is None else self.traffic.summary(),
+        }
+
     def snapshot(self) -> dict:
         now = time.time()
         with self._lock:
@@ -558,7 +579,9 @@ class MonitorEngine:
                 "source_kind": None if c is None else c.kind,
                 "source_label": None if c is None else c.label,
                 "note": None if c is None else c.note,
-                "sample_rate_hz": None if c is None else c.sample_rate_hz,
+                "sample_rate_hz": round(self.rate_hz, 1) if (c and c.live) else (
+                    None if c is None else c.sample_rate_hz),
+                "link": self._link_snapshot(),
                 "room": self.opts.room,
                 "contact": self.opts.contact,
                 "escalate_s": self.opts.escalate_s,
@@ -573,6 +596,15 @@ class MonitorEngine:
                     "still": round(self.profile.still_threshold, 4),
                     "occupied": round(self.profile.occupied_threshold, 4),
                     "sharp": round(self.profile.sharp_threshold, 4),
+                    # Separation is the one number that says whether this PLACEMENT can work.
+                    # Below ~2x the still and active levels overlap, so the room's own quiet
+                    # looks like a collapse and every alert is suspect. No threshold tuning
+                    # fixes it — the geometry has to change — so it is reported next to the
+                    # thresholds rather than buried in a log.
+                    "separation": round(self.profile.occupied_threshold
+                                        / max(self.profile.still_threshold, 1e-9), 1),
+                    "placement_ok": (self.profile.occupied_threshold
+                                     >= 2.0 * max(self.profile.still_threshold, 1e-9)),
                 },
                 "profile_summary": None if self.profile is None else self.profile.summary(),
                 "monitor": {
