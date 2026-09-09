@@ -104,7 +104,9 @@ the laptop sleeps or reboots** — re-attach is the #1 cause of "it stopped work
 
 ## 3. The live 2-board reader
 
-Implemented as `_LiveTwoBoard` in [`server/engine.py`](../server/engine.py). Three details
+Implemented as `LiveCSIReader` in
+[`wisp/source/live_reader.py`](../wisp/source/live_reader.py), which serves both rigs — pass
+`companion_port` for the two-board one. Three details
 matter, all learned the hard way:
 
 1. **Hold BOTH ports open, in run-mode.** Opening a serial port toggles the CP2102's
@@ -348,9 +350,10 @@ HTTP API (CORS enabled): `GET /` (dashboard), `GET /status` (JSON snapshot, poll
 ```
 server/
   app.py            Flask shell — routes + CLI flags
-  engine.py         MonitorEngine, _LiveTwoBoard (2-board reader), fallback chain, escalation
+  engine.py         MonitorEngine, source fallback chain, escalation, link telemetry
   dashboard.html    self-contained UI (activity meter, alert/escalation, LIVE/FALLBACK badge)
 wisp/
+  source/live_reader.py   the live reader (single board, or +companion for 2 boards)
   features/extract.py     motion intensity + transient sharpness
   calibrate/profile.py    RoomProfile.fit — thresholds + mask + model (adaptive or absolute)
   detect/state_machine.py NORMAL→DISTURBANCE→STILL→CONFIRMED + min_active_s / debounce

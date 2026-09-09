@@ -54,13 +54,19 @@ class Metrics:
         return sum(self.latencies) / len(self.latencies) if self.latencies else float("nan")
 
     def report(self) -> str:
+        # A recording with no staged collapses is a legitimate and important case — hours of
+        # ordinary life, where every alert is a false alarm. Printing "nan%" recall there
+        # reads as a bug; "n/a" says what is actually true.
+        recall = (f"{self.n_detected}/{self.n_events}  ({self.recall*100:.0f}%)"
+                  if self.n_events else "n/a (no staged collapses in this recording)")
+        latency = f"{self.mean_latency:.1f} s" if self.latencies else "n/a"
         lines = [
             "=== wisp evaluation (Phase 0 gate) ===",
             f"recording duration     : {self.duration_s:.0f} s",
             f"staged collapses       : {self.n_events}",
-            f"recall                 : {self.n_detected}/{self.n_events}  ({self.recall*100:.0f}%)",
+            f"recall                 : {recall}",
             f"kind labelled correctly: {self.kind_correct}/{self.n_detected}",
-            f"detection latency (avg): {self.mean_latency:.1f} s",
+            f"detection latency (avg): {latency}",
             f"FALSE ALARMS           : {self.false_alarms}",
             f"  -> per day           : {self.false_alarms_per_day:.2f}",
             f"  -> per week           : {self.false_alarms_per_week:.2f}   <-- the gate number",
