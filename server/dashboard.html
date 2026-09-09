@@ -217,6 +217,15 @@
       <div class="kv"><span class="k">sample rate</span><span class="v" id="pRate">—</span></div>
       <div class="kv"><span class="k">packets seen</span><span class="v" id="pPackets">—</span></div>
       <div class="kv"><span class="k">still / occupied / sharp</span><span class="v" id="pThresh">—</span></div>
+      <div class="kv"><span class="k">placement separation</span><span class="v" id="pSep">—</span></div>
+    </div>
+    <div class="panel" id="linkPanel" style="display:none">
+      <h3>Radio link</h3>
+      <div class="kv"><span class="k">board</span><span class="v" id="lIp">—</span></div>
+      <div class="kv"><span class="k">measured rate</span><span class="v" id="lRate">—</span></div>
+      <div class="kv"><span class="k">dropped / gaps</span><span class="v" id="lLoss">—</span></div>
+      <div class="kv"><span class="k">subcarriers · RSSI</span><span class="v" id="lRadio">—</span></div>
+      <div class="kv"><span class="k">traffic generator</span><span class="v" id="lTraffic">—</span></div>
     </div>
   </div>
 
@@ -320,11 +329,40 @@
     $("pPackets").textContent = (d.packets ?? "—").toLocaleString?.() ?? d.packets;
     const th = d.thresholds;
     $("pThresh").textContent = th ? `${th.still} / ${th.occupied} / ${th.sharp}` : "—";
+    // Separation is the single number that says whether this PLACEMENT can distinguish a
+    // moving person from a still room. Below ~2x it cannot, and no tuning changes that.
+    $("pSep").textContent = th && th.separation != null
+      ? `${th.separation}x ${th.separation >= 5 ? "(excellent)" : th.separation >= 2 ? "(usable)" : "(TOO WEAK)"}`
+      : "—";
+
+    // ---- radio link (live boards only): the numbers that reveal a sensor which looks
+    // healthy on screen while running at 4 Hz or throwing away a third of its packets ----
+    const lk = d.link;
+    $("linkPanel").style.display = lk ? "" : "none";
+    if (lk) {
+      $("lIp").textContent = (lk.board_ip || "—") + (lk.state ? ` · ${lk.state}` : "");
+      $("lRate").textContent = lk.measured_rate_hz != null ? lk.measured_rate_hz + " Hz" : "—";
+      $("lLoss").textContent = `${lk.firmware_dropped ?? 0} dropped · ${lk.gaps} gaps`
+        + (lk.longest_gap_s ? ` (longest ${lk.longest_gap_s}s)` : "");
+      $("lRadio").textContent = `${lk.subcarriers ?? "—"} · ${lk.rssi != null ? lk.rssi + " dBm" : "—"}`;
+      $("lTraffic").textContent = lk.traffic
+        ? `${lk.traffic.achieved_hz ?? "?"} Hz -> ${lk.traffic.host}:${lk.traffic.port}`
+        : (lk.two_board ? "n/a (2-board rig)" : "off");
+    }
     drawSpark(m.history || []);
 
     // ---- banners ----
-    toggleBanner($("warnBanner"), d.stale ? "⚠ Live feed lost — no CSI packets from the board for a few seconds." :
-      (d.stream_ended && !d.live ? "Stream ended." : ""));
+    // Warnings, most-urgent first. The placement warning is not cosmetic: with the still
+    // and active levels overlapping, the room's own quiet looks like a collapse, so any
+    // alert shown below is untrustworthy and the operator has to know that.
+    let warn = "";
+    if (d.stale) warn = "⚠ Live feed lost — no CSI packets from the board for a few seconds.";
+    else if (d.thresholds && d.thresholds.placement_ok === false)
+      warn = `⚠ Placement too weak (${d.thresholds.separation}x separation, 2x is the minimum) — `
+           + "moving and still look alike here, so alerts cannot be trusted. Reposition the board "
+           + "so a person crosses the path between it and the transmitter, then recalibrate.";
+    else if (d.stream_ended && !d.live) warn = "Stream ended.";
+    toggleBanner($("warnBanner"), warn);
     toggleBanner($("errBanner"), d.error ? ("Engine error: " + d.error) : "");
 
     // ---- footnote (honest framing, always shows the mode) ----
